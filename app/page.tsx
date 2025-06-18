@@ -1,87 +1,69 @@
 "use client";
-import Image from "next/image";
-import { useEffect, useRef, useState } from "react";
 
-const { createFFmpeg, fetchFile } = require("@ffmpeg/ffmpeg");
+import { createFFmpeg, fetchFile } from "@ffmpeg/ffmpeg";
+import Image from "next/image";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 
 export default function Home() {
-  const [timer, setTimer] = useState(0);
-  const [duration, setDuration] = useState(0);
+  const [currentTimelineTime, setCurrentTimelineTime] = useState(0);
+  const [projectDuration, setProjectDuration] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [videos, setVideos] = useState<HTMLVideoElement[]>([]);
-  const [audios, setAudios] = useState<any[]>([]);
+
+  const [videoTimeline, setVideoTimeline] = useState<VideoClip[]>([]);
+  const [audioTimeline, setAudioTimeline] = useState<AudioClip[]>([]);
+
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [currentAudioIndex, setCurrentAudioIndex] = useState<number>(0);
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const audioRef = useRef<HTMLAudioElement>(null);
-  const videoInputRef = useRef(null);
-  const audioInputRef = useRef(null);
+  const videoInputRef = useRef<HTMLInputElement>(null);
+  const audioInputRef = useRef<HTMLInputElement>(null);
+
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioSourcesRef = useRef<AudioBufferSourceNode[]>([]);
+
+  const animationFrameId = useRef<number | null>(null);
+
+  const offscreenCanvasRef = useRef<HTMLCanvasElement>(null);
+  const offscreenCtxRef = useRef<CanvasRenderingContext2D | null>(null);
+
+  const pixelsPerSecond = 30;
+
   const ffmpeg = createFFmpeg({
     corePath: "https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js",
-    // log: true,
   });
-  const pixelsPerSecond = 60;
 
-  function play() {
-    if (isPlaying) {
-      audioRef.current?.pause();
-      videoRef.current.pause();
-    } else {
-      audioRef.current?.play();
-      videoRef.current.play();
+  useEffect(() => {
+    if (!audioContextRef.current) {
+      audioContextRef.current = new (window.AudioContext ||
+        window.webkitAudioContext)();
     }
-    setIsPlaying(!isPlaying);
-  }
 
-  function handleVideoImport() {
+    return () => {
+      if (
+        audioContextRef.current &&
+        audioContextRef.current.state !== "closed"
+      ) {
+        audioContextRef.current.close();
+        audioContextRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    const offscreenCanvas = document.createElement("canvas");
+    const offscreenCtx = offscreenCanvas.getContext("2d");
+
+    if (offscreenCtx) {
+      offscreenCanvasRef.current = offscreenCanvas;
+      offscreenCtxRef.current = offscreenCtx;
+    }
+  }, []);
+
+  const handleVideoImportClick = () => {
     videoInputRef.current?.click();
-  }
+  };
 
-  function handleAudioImport() {
+  const handleAudioImportClick = () => {
     audioInputRef.current?.click();
-  }
-
-  function handleAudioFileChange(event) {
-    const file = event.target.files[0];
-
-    if (file && file.type.startsWith("audio/")) {
-      const url = URL.createObjectURL(file);
-      const audio = new Audio(url);
-
-      audio.onloadedmetadata = () => {
-        const audioData = {
-          id: Date.now(),
-          name: file.name,
-          url: url,
-          duration: audio.duration,
-        };
-
-        setAudios((prev) => {
-          // Set the first audio to the audio element
-          if (prev.length === 0 && audioRef.current) {
-            audioRef.current.src = url;
-          }
-          return [...prev, audioData];
-        });
-
-        setDuration(() => {
-          let duration = 0;
-
-          audios.forEach((a) => {
-            duration += a.duration;
-          });
-          if (duration + audio.duration > (videoRef.current?.duration || 0)) {
-            return duration + audio.duration;
-          }
-
-          return videoRef.current?.duration;
-        });
-
-        // Don't revoke the URL here - we need it for playback!
-        // URL.revokeObjectURL(url);
-      };
-    }
-  }
+  };
 
   const handleVideoFileChange = async (
     event: React.ChangeEvent<HTMLInputElement>
@@ -111,179 +93,413 @@ export default function Home() {
         "-i",
         "reversed.mp4",
         "-filter_complex",
-        "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[outv][outa]",
+        "[0:v][1:v]concat=n=2:v=1[outv]",
         "-map",
         "[outv]",
-        "-map",
-        "[outa]",
         "combined.mp4"
       );
 
       const data = await ffmpeg.FS("readFile", "combined.mp4");
       const combinedBlob = new Blob([data.buffer], { type: "video/mp4" });
       const url = URL.createObjectURL(combinedBlob);
+      // const url = URL.createObjectURL(file);
+      const tempVideo = document.createElement("video");
 
-      if (videoSourceRef.current) {
-        // Clear any previous source
-        if (videoSourceRef.current.src) {
-          URL.revokeObjectURL(videoSourceRef.current.src);
-        }
-        videoSourceRef.current.src = url;
-        videoSourceRef.current.load(); // Load the new video
-        setIsPlaying(false); // Reset playing state
-        setCurrentTime(0); // Reset timer
-        setVideoDuration(0); // Reset duration
-      }
+      tempVideo.src = url;
+      tempVideo.preload = "metadata";
+      tempVideo.muted = true;
+
+      tempVideo.onloadedmetadata = () => {
+        const newClip: VideoClip = {
+          id: `video-${Date.now()}`,
+          file: file,
+          sourceUrl: url,
+          originalDuration: tempVideo.duration,
+          timelineStart:
+            videoTimeline.length > 0
+              ? videoTimeline[videoTimeline.length - 1].timelineEnd
+              : 0,
+          timelineEnd:
+            (videoTimeline.length > 0
+              ? videoTimeline[videoTimeline.length - 1].timelineEnd
+              : 0) + tempVideo.duration,
+          clipStartOffset: 0,
+          clipDuration: tempVideo.duration,
+          hiddenVideoRef: React.createRef<HTMLVideoElement>(),
+        };
+
+        setVideoTimeline((prev) => [...prev, newClip]);
+        setProjectDuration(Math.max(projectDuration, newClip.timelineEnd));
+
+        const hiddenVideoEl = document.createElement("video");
+
+        hiddenVideoEl.id = newClip.id;
+        hiddenVideoEl.src = newClip.sourceUrl;
+        hiddenVideoEl.style.display = "none";
+        hiddenVideoEl.muted = true;
+        hiddenVideoEl.preload = "auto";
+        (
+          newClip.hiddenVideoRef as React.MutableRefObject<HTMLVideoElement>
+        ).current = hiddenVideoEl;
+        document.body.appendChild(hiddenVideoEl);
+      };
+      tempVideo.load();
     }
   };
 
-  async function handleVideoFileChange(event) {
-    const file = event.target.files[0];
+  const handleAudioFileChange = async (
+    event: React.ChangeEvent<HTMLInputElement>
+  ) => {
+    const file = event.target.files?.[0];
 
-    if (file && file.type.startsWith("video/") && videoRef.current) {
-      try {
-        if (!ffmpeg.isLoaded()) {
-          await ffmpeg.load();
-        }
+    if (file && file.type.startsWith("audio/") && audioContextRef.current) {
+      const audioContext = audioContextRef.current;
+      const fileReader = new FileReader();
 
-        await ffmpeg.FS("writeFile", "original.mp4", await fetchFile(file));
-
-        await ffmpeg.run(
-          "-i",
-          "original.mp4",
-          "-vf",
-          "reverse",
-          "-af",
-          "areverse",
-          "reversed.mp4"
-        );
-
-        await ffmpeg.run(
-          "-i",
-          "original.mp4",
-          "-i",
-          "reversed.mp4",
-          "-filter_complex",
-          "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[outv][outa]",
-          "-map",
-          "[outv]",
-          "-map",
-          "[outa]",
-          "combined.mp4"
-        );
-
-        const data = await ffmpeg.FS("readFile", "combined.mp4");
-        const combinedBlob = new Blob([data.buffer], { type: "video/mp4" });
-        const url = URL.createObjectURL(combinedBlob);
-
-        videoRef.current.src = url;
-
-        await new Promise((resolve) => {
-          const handleLoadedMetadata = () => {
-            videoRef.current.removeEventListener(
-              "loadedmetadata",
-              handleLoadedMetadata
-            );
-            resolve();
+      fileReader.onload = async () => {
+        try {
+          const audioBuffer = await audioContext.decodeAudioData(
+            fileReader.result as ArrayBuffer
+          );
+          const newClip: AudioClip = {
+            id: `audio-${Date.now()}`,
+            name: file.name,
+            file: file,
+            sourceUrl: URL.createObjectURL(file),
+            originalDuration: audioBuffer.duration,
+            timelineStart:
+              audioTimeline.length > 0
+                ? audioTimeline[audioTimeline.length - 1].timelineEnd
+                : 0,
+            timelineEnd:
+              (audioTimeline.length > 0
+                ? audioTimeline[audioTimeline.length - 1].timelineEnd
+                : 0) + audioBuffer.duration,
+            clipStartOffset: 0,
+            clipDuration: audioBuffer.duration,
+            audioBuffer: audioBuffer,
+            gainNode: audioContext.createGain(),
           };
 
-          videoRef.current.addEventListener(
-            "loadedmetadata",
-            handleLoadedMetadata
-          );
-        });
+          newClip.gainNode?.connect(audioContext.destination);
 
-        const videoData = {
-          id: Date.now(),
-          name: file.name,
-          url: url,
-          duration: videoRef.current.duration,
-          file: file,
-        };
-
-        setVideos((prev) => [...prev, videoData]);
-        setIsPlaying(false);
-
-        setDuration((prevDuration) => {
-          let audioDur = 0;
-
-          audios.forEach((a) => {
-            audioDur += a.duration;
-          });
-
-          return Math.max(videoRef.current.duration, audioDur);
-        });
-
-        await ffmpeg.FS("unlink", "original.mp4");
-        await ffmpeg.FS("unlink", "reversed.mp4");
-        await ffmpeg.FS("unlink", "combined.mp4");
-      } catch (error) {
-        console.error(error);
-      }
+          setAudioTimeline((prev) => [...prev, newClip]);
+          setProjectDuration(Math.max(projectDuration, newClip.timelineEnd));
+        } catch (error) {
+          console.error("Error decoding audio data:", error);
+        }
+      };
+      fileReader.readAsArrayBuffer(file);
     }
-  }
+  };
 
-  function handleVideoLoadedMetadata() {
-    if (videoRef.current) {
-      let audioDur = 0;
+  const play = async () => {
+    if (videoTimeline.length === 0 && audioTimeline.length === 0) {
+      return;
+    }
 
-      audios.forEach((a) => {
-        audioDur += a.duration;
+    if (isPlaying) {
+      if (
+        audioContextRef.current &&
+        audioContextRef.current.state === "running"
+      ) {
+        await audioContextRef.current.suspend();
+      }
+      videoTimeline.forEach((clip) => {
+        if (clip.hiddenVideoRef.current) {
+          clip.hiddenVideoRef.current.pause();
+        }
       });
-      if (videoRef.current.duration > audioDur) {
-        setDuration(videoRef.current.duration);
-      } else {
-        setDuration(audioDur);
-      }
-    }
-  }
-
-  // Handle audio ended event
-  function handleAudioEnded() {
-    if (currentAudioIndex < audios.length - 1) {
-      setCurrentAudioIndex(currentAudioIndex + 1);
-    } else {
+      audioSourcesRef.current.forEach((source) => source.stop());
+      audioSourcesRef.current = [];
       setIsPlaying(false);
-      setCurrentAudioIndex(0);
-    }
-  }
+    } else {
+      if (
+        !audioContextRef.current ||
+        audioContextRef.current.state === "closed"
+      ) {
+        audioContextRef.current = new (window.AudioContext ||
+          window.webkitAudioContext)();
 
-  // useEffect(() => {
-  //   return () => {
-  //     audios.forEach((audio) => {
-  //       if (audio.url && audio.url.startsWith("blob:")) {
-  //         URL.revokeObjectURL(audio.url);
-  //       }
-  //     });
-  //     videos.forEach((video) => {
-  //       if (video.url && video.url.startsWith("blob:")) {
-  //         URL.revokeObjectURL(video.url);
-  //       }
-  //     });
-  //   };
-  // }, [audios, videos]);
+        audioTimeline.forEach((clip) => {
+          if (clip.gainNode) {
+            clip.gainNode.disconnect();
+          }
+          clip.gainNode = audioContextRef.current!.createGain();
+          clip.gainNode.connect(audioContextRef.current!.destination);
+        });
+      }
+
+      if (audioContextRef.current.state === "suspended") {
+        await audioContextRef.current.resume();
+      }
+
+      audioSourcesRef.current = [];
+
+      audioTimeline.forEach((clip) => {
+        if (clip.audioBuffer && audioContextRef.current) {
+          const source = audioContextRef.current.createBufferSource();
+
+          source.buffer = clip.audioBuffer;
+          source.connect(clip.gainNode!);
+
+          const startTime = Math.max(
+            0,
+            clip.timelineStart - currentTimelineTime
+          );
+          const offset = Math.max(
+            0,
+            currentTimelineTime - clip.timelineStart + clip.clipStartOffset
+          );
+          const durationToPlay = Math.max(0, clip.clipDuration - offset);
+
+          if (durationToPlay > 0) {
+            source.start(
+              audioContextRef.current.currentTime + startTime,
+              offset,
+              durationToPlay
+            );
+            audioSourcesRef.current.push(source);
+          }
+        }
+      });
+
+      videoTimeline.forEach((clip) => {
+        if (clip.hiddenVideoRef.current) {
+          const videoEl = clip.hiddenVideoRef.current;
+          const videoTime = Math.max(
+            0,
+            currentTimelineTime - clip.timelineStart + clip.clipStartOffset
+          );
+
+          videoEl.currentTime = videoTime;
+          videoEl
+            .play()
+            .catch((e) => console.error("Error playing hidden video:", e));
+        }
+      });
+
+      setIsPlaying(true);
+    }
+  };
+
+  const renderCanvas = useCallback(() => {
+    const canvas = canvasRef.current;
+    const audioContext = audioContextRef.current;
+    const offscreenCanvas = offscreenCanvasRef.current;
+    const offscreenCtx = offscreenCtxRef.current;
+
+    if (!canvas || !audioContext || !offscreenCanvas || !offscreenCtx) {
+      animationFrameId.current = null;
+      return;
+    }
+
+    const ctx = canvas.getContext("2d");
+
+    if (!ctx) {
+      animationFrameId.current = null;
+      return;
+    }
+
+    const currentMasterTime = audioContext.currentTime;
+
+    setCurrentTimelineTime(currentMasterTime);
+
+    offscreenCtx.clearRect(0, 0, offscreenCanvas.width, offscreenCanvas.height);
+
+    const activeVideoClips = videoTimeline.filter(
+      (clip) =>
+        currentMasterTime >= clip.timelineStart &&
+        currentMasterTime < clip.timelineEnd
+    );
+
+    if (activeVideoClips.length > 0) {
+      const mainClip = activeVideoClips[0];
+      const hiddenVideoElement = mainClip.hiddenVideoRef.current;
+
+      if (
+        hiddenVideoElement &&
+        hiddenVideoElement.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA
+      ) {
+        const timeRelativeToClipStart =
+          currentMasterTime - mainClip.timelineStart;
+        const loopedVideoContentTime =
+          (mainClip.clipStartOffset + timeRelativeToClipStart) %
+          mainClip.originalDuration;
+
+        if (
+          Math.abs(hiddenVideoElement.currentTime - loopedVideoContentTime) >
+          0.05
+        ) {
+          hiddenVideoElement.currentTime = loopedVideoContentTime;
+        }
+
+        if (
+          offscreenCanvas.width !== hiddenVideoElement.videoWidth ||
+          offscreenCanvas.height !== hiddenVideoElement.videoHeight
+        ) {
+          offscreenCanvas.width = hiddenVideoElement.videoWidth;
+          offscreenCanvas.height = hiddenVideoElement.videoHeight;
+        }
+
+        offscreenCtx.drawImage(
+          hiddenVideoElement,
+          0,
+          0,
+          offscreenCanvas.width,
+          offscreenCanvas.height
+        );
+
+        if (
+          canvas.width !== offscreenCanvas.width ||
+          canvas.height !== offscreenCanvas.height
+        ) {
+          canvas.width = offscreenCanvas.width;
+          canvas.height = offscreenCanvas.height;
+        }
+        ctx.drawImage(offscreenCanvas, 0, 0);
+      }
+    } else {
+      if (canvas.width === 0 || canvas.height === 0) {
+        canvas.width = 1280;
+        canvas.height = 720;
+        if (offscreenCanvas.width === 0 || offscreenCanvas.height === 0) {
+          offscreenCanvas.width = 1280;
+          offscreenCanvas.height = 720;
+        }
+      }
+      ctx.fillStyle = "black";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+
+    if (currentMasterTime >= projectDuration && projectDuration > 0) {
+      setIsPlaying(false);
+      setCurrentTimelineTime(0);
+      if (audioContext.state === "running") {
+        audioContext.suspend();
+        audioSourcesRef.current.forEach((source) => source.stop());
+        audioSourcesRef.current = [];
+      }
+      if (audioContextRef.current) {
+        audioContextRef.current.close();
+        audioContextRef.current = null;
+      }
+      videoTimeline.forEach((clip) => {
+        if (clip.hiddenVideoRef.current) {
+          clip.hiddenVideoRef.current.pause();
+          clip.hiddenVideoRef.current.currentTime = 0;
+        }
+      });
+      return;
+    }
+
+    if (isPlaying) {
+      animationFrameId.current = requestAnimationFrame(renderCanvas);
+    }
+  }, [
+    isPlaying,
+    videoTimeline,
+    audioTimeline,
+    currentTimelineTime,
+    projectDuration,
+  ]);
+
+  const handleTimelineSeek = (
+    event: React.MouseEvent<HTMLDivElement, MouseEvent>
+  ) => {
+    if (!audioContextRef.current) return;
+
+    const timelineElement = event.currentTarget;
+    const clickX = event.clientX - timelineElement.getBoundingClientRect().left;
+
+    const newTime = clickX / pixelsPerSecond;
+
+    const clampedTime = Math.max(0, Math.min(newTime, projectDuration));
+
+    if (isPlaying) {
+      play();
+    }
+
+    setCurrentTimelineTime(clampedTime);
+
+    videoTimeline.forEach((clip) => {
+      if (clip.hiddenVideoRef.current) {
+        const videoEl = clip.hiddenVideoRef.current;
+        const videoTime = Math.max(
+          0,
+          clampedTime - clip.timelineStart + clip.clipStartOffset
+        );
+
+        videoEl.currentTime = videoTime;
+        videoEl.pause();
+      }
+    });
+
+    if (audioContextRef.current) {
+      if (audioContextRef.current.state === "running") {
+        audioContextRef.current.suspend();
+      }
+      audioContextRef.current.close();
+      audioContextRef.current = null;
+    }
+  };
 
   useEffect(() => {
-    if (audioRef.current && audios.length > 0) {
-      audioRef.current.pause();
-      audioRef.current.src = audios[currentAudioIndex]?.url || "";
-      audioRef.current.load();
-      audioRef.current.currentTime = 0;
-
-      if (isPlaying) {
-        audioRef.current.play();
+    if (isPlaying) {
+      animationFrameId.current = requestAnimationFrame(renderCanvas);
+    } else {
+      if (animationFrameId.current) {
+        cancelAnimationFrame(animationFrameId.current);
+        animationFrameId.current = null;
       }
     }
-    console.log(audioRef.current);
-  }, [currentAudioIndex, audios, isPlaying]);
 
-  const TimeRuler = ({ duration }) => {
-    const totalWidth = Math.max(duration * pixelsPerSecond, 1000);
+    return () => {
+      if (animationFrameId.current) {
+        cancelAnimationFrame(animationFrameId.current);
+      }
+    };
+  }, [isPlaying, renderCanvas]);
+
+  useEffect(() => {
+    return () => {
+      videoTimeline.forEach((clip) => {
+        const hiddenVideoEl = document.getElementById(clip.id);
+
+        if (hiddenVideoEl) {
+          if (
+            hiddenVideoEl instanceof HTMLVideoElement &&
+            hiddenVideoEl.src.startsWith("blob:")
+          ) {
+            URL.revokeObjectURL(hiddenVideoEl.src);
+          }
+          hiddenVideoEl.remove();
+        }
+      });
+      audioTimeline.forEach((clip) => {
+        if (clip.sourceUrl.startsWith("blob:")) {
+          URL.revokeObjectURL(clip.sourceUrl);
+        }
+      });
+    };
+  }, [videoTimeline, audioTimeline]);
+
+  const formatTime = (seconds: number) => {
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = Math.floor(seconds % 60);
+    const paddedMinutes = String(minutes).padStart(2, "0");
+    const paddedSeconds = String(remainingSeconds).padStart(2, "0");
+
+    return `${paddedMinutes}:${paddedSeconds}`;
+  };
+
+  const TimeRuler = ({ duration }: { duration: number }) => {
+    const totalWidth = duration * pixelsPerSecond;
     const marks = [];
 
     for (let i = 0; i <= Math.ceil(duration); i++) {
       const isMajorMark = i % 5 === 0;
-      const position = (i / duration) * totalWidth;
+      const position = i * pixelsPerSecond;
 
       marks.push(
         <div
@@ -291,12 +507,10 @@ export default function Home() {
           className="absolute flex flex-col items-center"
           style={{ left: `${position}px` }}
         >
-          <div
-            className={`bg-white ${isMajorMark ? "w-0.5 h-4" : "w-px h-2"}`}
-          />
-          {isMajorMark && (
-            <span className="text-xs text-white mt-1 select-none">
-              {Math.floor(i / 60)}:{(i % 60).toString().padStart(2, "0")}
+          <div className={`bg-white w-px ${isMajorMark ? " h-4" : " h-2"}`} />
+          {isMajorMark && i != 0 && (
+            <span className="text-xs text-white select-none absolute mt-4">
+              {formatTime(i)}
             </span>
           )}
         </div>
@@ -304,23 +518,24 @@ export default function Home() {
     }
 
     return (
-      <div className="relative h-full" style={{ width: `${totalWidth}px` }}>
+      <div
+        className="relative h-full cursor-pointer"
+        style={{ width: `${totalWidth}px` }}
+        onClick={handleTimelineSeek}
+      >
         {marks}
       </div>
     );
   };
 
   return (
-    <section className="flex flex-col items-center justify-center gap-2 bg-green-300 w-full h-full">
-      {/* Hidden audio element */}
-      <audio ref={audioRef} onEnded={handleAudioEnded} className="hidden" />
-
-      <div className="w-full text-white bg-black p-4 flex justify-between items-center">
-        <h1>Projekt</h1>
+    <section className="flex flex-col items-center justify-center gap-2 bg-green-300 w-full min-h-screen p-4">
+      <div className="w-full text-white bg-black p-4 flex justify-between items-center rounded-t-lg max-w-6xl">
+        <h1 className="text-lg font-bold">Project</h1>
         <div className="flex gap-2">
           <button
             className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded flex items-center gap-2"
-            onClick={handleVideoImport}
+            onClick={handleVideoImportClick}
           >
             <svg
               xmlns="http://www.w3.org/2000/svg"
@@ -339,7 +554,7 @@ export default function Home() {
             Import Video
           </button>
           <button
-            onClick={handleAudioImport}
+            onClick={handleAudioImportClick}
             className="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded flex items-center gap-2"
           >
             <svg
@@ -358,7 +573,6 @@ export default function Home() {
             </svg>
             Import Audio
           </button>
-          {videos.length == 0 && audios.length == 0}
         </div>
         <input
           ref={videoInputRef}
@@ -377,55 +591,90 @@ export default function Home() {
       </div>
 
       <div
-        className={`bg-black flex justify-center items-center ${videos.length == 0 && audios.length == 0 ? "cursor-default" : "cursor-pointer"}`}
+        className={`relative bg-black flex justify-center items-center w-full max-w-6xl aspect-video ${videoTimeline.length === 0 ? "cursor-default" : "cursor-pointer"}`}
         onClick={play}
       >
-        {/* {videos.length == 0 && audios.length == 0 && (
+        {videoTimeline.length == 0 && audioTimeline.length == 0 && (
+          // <p>ajskdhkajgdkasd</p>
+          // <img src="/mobile-suit-gundam-gquuuuuux-4.jpg" alt="something" />
           <Image
             src={"/mobile-suit-gundam-gquuuuuux-4.jpg"}
-            width={1280}
-            height={720}
+            width={0}
+            height={0}
+            sizes="100%"
             alt="Picture of the author"
+            className="flex items-center justify-center"
           />
-        )} */}
-
-        {(videos.length > 0 || audios.length > 0) && !isPlaying && (
-          <div className="absolute text-white z-10 pointer-events-none">
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              fill="none"
-              viewBox="0 0 24 24"
-              strokeWidth={1.5}
-              stroke="currentColor"
-              className="size-24"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                d="M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z"
-              />
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                d="M15.91 11.672a.375.375 0 0 1 0 .656l-5.603 3.113a.375.375 0 0 1-.557-.328V8.887c0-.286.307-.466.557-.327l5.603 3.112Z"
-              />
-            </svg>
-          </div>
         )}
-        <video
-          ref={videoRef}
-          width="1280"
-          height="720"
-          preload="metadata"
-          onLoadedMetadata={handleVideoLoadedMetadata}
-          className={videos ? "block" : "hidden"}
-          muted
-          loop
-        />
+        <canvas ref={canvasRef} className="max-w-full max-h-full" />
+
+        {(videoTimeline.length > 0 || audioTimeline.length > 0) &&
+          !isPlaying && (
+            <div className="absolute text-white z-10 pointer-events-none">
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                fill="none"
+                viewBox="0 0 24 24"
+                strokeWidth={1.5}
+                stroke="currentColor"
+                className="size-24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  d="M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z"
+                />
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  d="M15.91 11.672a.375.375 0 0 1 0 .656l-5.603 3.113a.375.375 0 0 1-.557-.328V8.887c0-.286.307-.466.557-.327l5.603 3.112Z"
+                />
+              </svg>
+            </div>
+          )}
       </div>
 
-      <div className="w-full h-60 bg-black flex flex-row">
-        <div className="w-[5%] text-white">
+      {/* <div className="w-full max-w-6xl bg-black p-4 flex justify-between items-center rounded-b-lg text-white">
+        <button
+          onClick={play}
+          className="p-2 bg-gray-700 hover:bg-gray-600 rounded"
+          disabled={videoTimeline.length === 0 && audioTimeline.length === 0}
+        >
+          {isPlaying ? (
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              viewBox="0 0 24 24"
+              fill="currentColor"
+              className="size-6"
+            >
+              <path
+                fillRule="evenodd"
+                d="M6.75 5.25a.75.75 0 0 1 .75-.75H9a.75.75 0 0 1 .75.75v13.5a.75.75 0 0 1-.75.75H7.5a.75.75 0 0 1-.75-.75V5.25Zm7.5 0a.75.75 0 0 1 .75-.75h1.5a.75.75 0 0 1 .75.75v13.5a.75.75 0 0 1-.75.75h-1.5a.75.75 0 0 1-.75-.75V5.25Z"
+                clipRule="evenodd"
+              />
+            </svg>
+          ) : (
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              viewBox="0 0 24 24"
+              fill="currentColor"
+              className="size-6"
+            >
+              <path
+                fillRule="evenodd"
+                d="M4.5 5.653c0-1.427 1.529-2.33 2.779-1.643l11.54 6.347c1.295.712 1.295 2.561 0 3.273L7.28 19.99c-1.25.687-2.779-.217-2.779-1.643V5.653Z"
+                clipRule="evenodd"
+              />
+            </svg>
+          )}
+        </button>
+        <div className="text-sm">
+          {formatTime(currentTimelineTime)} / {formatTime(projectDuration)}
+        </div>
+      </div> */}
+
+      <div className="w-full max-w-6xl h-60 bg-black flex flex-row rounded-lg overflow-hidden">
+        <div className="w-[5%] text-white p-2 flex flex-col justify-around items-center border-r border-gray-700">
           <div className="h-[20%]"></div>
           <div className="h-[20%] flex justify-center items-center">
             <svg
@@ -478,34 +727,40 @@ export default function Home() {
         </div>
         <div className="w-px bg-gray-600"></div>
         <div className="w-full overflow-x-auto relative overflow-y-hidden">
-          <div className="absolute h-20 pointer-events-none z-10">
+          <div
+            className="absolute top-0 left-0 h-full pointer-events-none z-20"
+            style={{ left: `${currentTimelineTime * pixelsPerSecond}px` }}
+          >
             <div className="w-0.5 h-full bg-red-500"></div>
           </div>
-          <div className="h-[20%] w-full relative">
-            <TimeRuler duration={duration} />
+          <div className="h-[20%] w-full relative border-b border-gray-700">
+            <TimeRuler duration={projectDuration} />
           </div>
-          <div className="h-px bg-gray-600"></div>
-          <div className="h-[20%] flex text-white items-center"></div>
-          <div className="h-[40%] flex items-center w-full">
-            {videos.map((video) => (
+          <div className="h-[20%] flex items-center w-full relative border-b border-gray-700 box-border">
+            asdjaslkjdl
+          </div>
+          <div className="h-[40%] flex items-center w-full relative border-b border-gray-700 box-border">
+            {videoTimeline.map((video) => (
               <div
                 key={video.id}
-                className=" flex items-center text-sm font-medium rounded bg-green-400 cursor-pointer"
+                className="absolute flex items-center text-sm font-medium rounded bg-purple-600 text-white truncate px-2 h-full overflow-hidden"
                 style={{
-                  width: `${500000}px`,
+                  left: `${video.timelineStart * pixelsPerSecond}px`,
+                  width: `${video.clipDuration * pixelsPerSecond}px`,
                 }}
               >
-                {video.name}
+                {video.file.name}
               </div>
             ))}
           </div>
-          <div className="h-[20%] flex items-center w-full">
-            {audios.map((audio) => (
+          <div className="h-[20%] flex items-center w-full relative">
+            {audioTimeline.map((audio) => (
               <div
                 key={audio.id}
-                className=" flex items-center text-sm font-medium rounded bg-blue-400 cursor-pointer"
+                className="absolute flex items-center text-sm font-medium rounded bg-blue-600 text-white truncate px-2 h-full overflow-hidden"
                 style={{
-                  width: `${audio.duration * pixelsPerSecond}px`,
+                  left: `${audio.timelineStart * pixelsPerSecond}px`,
+                  width: `${audio.clipDuration * pixelsPerSecond}px`,
                 }}
               >
                 {audio.name}
